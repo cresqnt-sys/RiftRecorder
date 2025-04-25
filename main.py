@@ -76,33 +76,47 @@ class BGSI_Recorder:
             self.recorded = json.load(f)
 
     def keyboard_listener(self):
-        # Needs to be called within the thread
         self.wait_to_start(self.start_time)
         print(f"Keyboard listener started. Press '{self.stop_key}' to stop recording.")
 
+        # Define the hook callback function
+        def on_key_event(event: keyboard.KeyboardEvent):
+            # Prevent processing if recording stopped between event and callback
+            if self.stop_recording_flag:
+                return
+            
+            # Check for stop key
+            if event.name == self.stop_key and event.event_type == keyboard.KEY_DOWN:
+                print(f"'{self.stop_key}' pressed. Stopping recording.")
+                self.stop_recording() # This will set flag and unhook
+                return # Don't record the stop key itself
+
+            # Record event relative to start time
+            # Ensure recording has actually started
+            if self.start_time is not None and event.time >= self.start_time:
+                 timestamp = event.time - self.start_time
+                 print(f"  Recording KB Event: ['{event.event_type == keyboard.KEY_DOWN}', '{event.name}', {timestamp:.4f}]")
+                 self.recorded['keyboard'].append([
+                      event.event_type == keyboard.KEY_DOWN,
+                      event.name,
+                      timestamp
+                 ])
+
         try:
-            # keyboard.hook doesn't work reliably for stopping in a separate thread,
-            # so we use read_event in a loop.
+            # Hook the callback
+            keyboard.hook(on_key_event)
+            # Keep the listener thread alive until stop_recording is called
             while not self.stop_recording_flag:
-                event: keyboard.KeyboardEvent = keyboard.read_event(suppress=False) # Don't suppress, allow key presses
-
-                if self.stop_recording_flag: # Check flag again after read_event
-                    break
-
-                if event.name == self.stop_key and event.event_type == keyboard.KEY_DOWN:
-                    print(f"'{self.stop_key}' pressed. Stopping recording.")
-                    self.stop_recording()
-                    break
-
-                # Record event relative to start time
-                self.recorded['keyboard'].append([
-                    event.event_type == keyboard.KEY_DOWN,
-                    event.name,
-                    event.time - self.start_time
-                ])
+                time.sleep(0.1) # Prevent busy-waiting
         except Exception as e:
             print(f"Error in keyboard listener: {e}")
         finally:
+            # Ensure the hook is removed if the thread exits unexpectedly,
+            # though stop_recording should normally handle it.
+            try:
+                 keyboard.unhook(on_key_event)
+            except Exception as e:
+                 pass
             print("Keyboard listener finished.")
 
 
@@ -144,31 +158,41 @@ class BGSI_Recorder:
         # Removed 'else: print unknown' as it's not needed
 
     def stop_recording(self):
-        # This function might be called from the keyboard listener thread or the UI thread (via stop_action)
+        # This function might be called from the keyboard hook or the UI thread
         if not self.stop_recording_flag: # Prevent multiple calls
             print("Executing stop_recording...")
-            self.stop_recording_flag = True
+            self.stop_recording_flag = True # Set flag first
+            
+            # Unhook mouse and keyboard listeners
             try:
                 mouse.unhook(self.on_callback)
                 print("Mouse unhooked.")
             except Exception as e:
-                print(f"Error unhooking mouse: {e}")
+                print(f"Warning: Error unhooking mouse: {e}")
+            try:
+                # Unhook all keyboard hooks - includes the one set by keyboard_listener
+                # and potentially the one by stop_player_listener if somehow active.
+                keyboard.unhook_all()
+                print("All keyboard hooks removed.")
+            except Exception as e:
+                 print(f"Warning: Error unhooking keyboard: {e}")
 
-            # Note: We don't unhook keyboard here as read_event loop handles the stop flag.
-            # keyboard.unhook_all() # This might interfere with other apps or the UI stop key listener
-
-            # Short delay to allow listeners to potentially process the flag
+            # Short delay might not be necessary anymore, but can leave it
             time.sleep(0.1)
             print("stop_recording finished.")
-            # Return value is not used when called via UI stop button,
-            # but kept for potential direct usage.
             return self.recorded
 
 
     def play_keyboard(self, key_events: list):
+        print("play_keyboard started.")
         self.wait_to_start(self.play_start_time)
+        print("play_keyboard wait finished.")
 
-        for key in key_events:
+        for i, key in enumerate(key_events):
+            if not self.is_playing: # Check before processing event
+                print(f"play_keyboard: Stopping playback early (event {i}).")
+                break
+                
             pressed, scan_code, t = key
             
             # Calculate adjusted time based on speed factor
@@ -176,19 +200,26 @@ class BGSI_Recorder:
             current_playback_time = time.time() - self.play_start_time
             time_to_wait = adjusted_time - current_playback_time
 
+            print(f"  KB Play Event {i}: Data={key}, Orig_t={t:.4f}, Adj_t={adjusted_time:.4f}, Wait={time_to_wait:.4f}")
+
             if time_to_wait > 0:
                 time.sleep(time_to_wait)
 
-            if not self.is_playing: # Check flag before action and after sleep
+            if not self.is_playing: # Check flag again after sleep
+                print(f"play_keyboard: Stopping playback early after sleep (event {i}).")
                 break
 
             try:
+                action_str = "Press" if pressed else "Release"
+                print(f"    -> {action_str} '{scan_code}'")
                 if pressed:
                     keyboard.press(scan_code)
                 else:
                     keyboard.release(scan_code)
             except Exception as e:
-                print(f"Error playing keyboard event ({'press' if pressed else 'release'} {scan_code}): {e}")
+                print(f"Error playing keyboard event ({action_str} {scan_code}): {e}")
+        
+        print("play_keyboard finished.")
 
 
     def play_mouse(self, mouse_events: list):
@@ -309,9 +340,23 @@ class RecorderWorker(QObject):
             if self.action == 'record':
                 self.signals.status_update.emit(f"Recording starts in {self.kwargs.get('countdown', 0)}s...")
                 self.recorder.record(**self.kwargs)
+                print("--- Recording Finished ---")
+                print("Recorded Keyboard Events:")
+                for event in self.recorder.recorded['keyboard']:
+                    print(f"  {event}")
+                print("Recorded Mouse Events:")
+                print(f"  ({len(self.recorder.recorded['mouse'])} mouse events)") 
+                print("-------------------------")
                 self.signals.status_update.emit("Recording finished.")
             elif self.action == 'play':
                 self.signals.status_update.emit(f"Playback starts in {self.kwargs.get('countdown', 0)}s...")
+                print("--- Starting Playback ---")
+                print("Playing Keyboard Events:")
+                for event in self.recorder.recorded['keyboard']:
+                    print(f"  {event}")
+                print("Playing Mouse Events:")
+                print(f"  ({len(self.recorder.recorded['mouse'])} mouse events)") 
+                print("-------------------------")
                 self.recorder.play(**self.kwargs)
                 self.signals.status_update.emit("Playback finished.")
         except Exception as e:
@@ -443,34 +488,23 @@ class RecorderUI(QWidget):
 
 
     def stop_action(self):
-        if self.worker and hasattr(self.worker.recorder, 'stop_recording'):
-            # Try to gracefully stop recording
-            try:
-                self.worker.recorder.stop_recording() # Signal the recorder thread to stop
-                print("Stop recording requested.")
-            except Exception as e:
-                print(f"Error stopping recording: {e}")
+        print("Stop button clicked or action initiated.")
+        if self.worker and self.worker_thread and self.worker_thread.isRunning():
+            recorder_instance = self.worker.recorder
+            if self.worker.action == 'record' and hasattr(recorder_instance, 'stop_recording'):
+                print("Requesting stop recording...")
+                recorder_instance.stop_recording() # Signal the recorder thread to stop
 
-        if self.worker and hasattr(self.worker.recorder, 'is_playing'):
-             # Signal the player to stop
-             self.worker.recorder.is_playing = False
-             print("Stop playback requested.")
-
-        # Force thread termination if still running after a short delay (graceful stop might take time)
-        if self.worker_thread and self.worker_thread.isRunning():
-            print("Attempting to terminate worker thread.")
-            # self.worker_thread.quit() # Ask thread to exit event loop
-            # self.worker_thread.wait(1000) # Wait a bit
-            # if self.worker_thread.isRunning():
-            #     print("Force terminating thread.")
-            #     self.worker_thread.terminate() # Force terminate if still running
-            #     self.worker_thread.wait() # Wait for termination
-            # A simple flag might be safer than termination for now
-            pass # Relying on the flags set above
-
+            elif self.worker.action == 'play' and hasattr(recorder_instance, 'is_playing'):
+                 print("Requesting stop playback...")
+                 recorder_instance.is_playing = False # Signal the player to stop
+            else:
+                 print("No active record/play action found in worker to stop.")
+        else:
+             print("No worker thread running to stop.")
 
         self.update_status("Stop requested.")
-        # Don't immediately re-enable controls here, wait for worker finish signal
+        # UI controls will be re-enabled by on_worker_finished when the worker thread actually exits.
 
     def on_worker_finished(self):
         self.update_status("Idle")
